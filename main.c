@@ -253,7 +253,7 @@ int main(int argc, char **argv) {
             printf("Cold keys:        %zu\n", cold_keys);
             printf("Avg hot nodes/q:  %.3f\n", avg_hot_nodes_q);
             printf("Avg cold nodes/q: %.3f\n", avg_cold_nodes_q);
-
+            printf("Final D:          %.3f\n", s.final_sampling_rate); 
         }
 
         hc_free(idx);

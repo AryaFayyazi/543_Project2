@@ -17,12 +17,10 @@ HCIndex* hc_create(int64_t max_key, int btree_degree, HCParams params) {
     idx->params = params;
     memset(&idx->stats, 0, sizeof(HCStats));
 
-    // Init ML / regression state
+    // NEW: init adaptation state
     idx->last_q_for_adapt = 0;
-    idx->last_hot_nodes   = 0;
-    idx->last_cold_nodes  = 0;
-    idx->lr_w0            = 0.0;  // bias
-    idx->lr_w1            = 0.0;  // weight on D
+    idx->last_cost        = 0.0;
+    idx->last_D           = params.sampling_rate;
 
     return idx;
 }
@@ -46,87 +44,70 @@ void hc_insert(HCIndex *idx, BTKey k, BTPayload v) {
     bt_insert(idx->cold, k, v);
 }
 
-// --- ML: Online linear regression to adapt sampling rate D ------------
-//
-// We want to minimize cost(D) = node_visits_per_query(D).
-// Model:   cost_hat(D) = w0 + w1 * D
-// Update:  SGD on squared loss 0.5 * (cost_hat - cost)^2
-//          w0 <- w0 - eta * (cost_hat - cost)
-//          w1 <- w1 - eta * (cost_hat - cost) * D
-//
-// Then pick next D as argmin of cost_hat(D) over [0,1]:
-//          D* = clip( -w0 / w1, 0, 1 )
-//
+// --- NEW: ML-style adaptation of sampling rate D ------------------------
+
+// Adapt sampling_rate (D) based on observed cost = node_visits / query.
 static void hc_maybe_adapt_sampling(HCIndex *idx) {
     if (!idx->params.adapt_sampling)
         return;
 
-    const long MIN_DELTA_Q = 5000;   // adapt every 5k queries
-    const double ETA       = 0.01;   // learning rate for SGD
-
-    long q  = idx->stats.queries;
-    long H  = idx->stats.hot_node_visits;
-    long C  = idx->stats.cold_node_visits;
-
-    long dq = q - idx->last_q_for_adapt;
-    if (dq < MIN_DELTA_Q)
-        return;  // not enough new queries since last update
-
-    long dnodes = (H - idx->last_hot_nodes) + (C - idx->last_cold_nodes);
-    if (dq <= 0 || dnodes <= 0) {
-        // Avoid weird cases; just update bookkeeping.
-        idx->last_q_for_adapt = q;
-        idx->last_hot_nodes   = H;
-        idx->last_cold_nodes  = C;
+    const long MIN_DELTA_Q = 5000; // adjust every 5k queries
+    long q = idx->stats.queries;
+    if (q - idx->last_q_for_adapt < MIN_DELTA_Q)
         return;
+
+    double total_nodes = (double)idx->stats.hot_node_visits +
+                         (double)idx->stats.cold_node_visits;
+    double cost = (q > 0) ? (total_nodes / (double)q) : 0.0;
+
+    double D = idx->params.sampling_rate;
+
+    if (idx->last_q_for_adapt == 0) {
+        // FIRST adaptation: always move D a bit.
+        // Use hot-hit fraction to choose direction.
+        double hot_frac = (double)idx->stats.hot_hits / (double)(q ? q : 1);
+        double target_hot = 0.6;  // heuristic target hot-hit ratio
+
+        if (hot_frac < target_hot) {
+            // Hot tier under-utilized → increase D
+            D += 0.05;
+        } else {
+            // Hot tier maybe too big / too aggressive → decrease D
+            D -= 0.05;
+        }
+    } else {
+        // SUBSEQUENT adaptations: look at how cost changed since last time.
+        double dC = cost - idx->last_cost;
+        double dD = D - idx->last_D;
+
+        if (fabs(dD) < 1e-9) {
+            // If we somehow didn't move last time, nudge based on hot_frac.
+            double hot_frac = (double)idx->stats.hot_hits / (double)(q ? q : 1);
+            double target_hot = 0.6;
+            if (hot_frac < target_hot) D += 0.05;
+            else                       D -= 0.05;
+        } else {
+            // If increasing D last time decreased cost → keep that direction.
+            // If it increased cost → reverse direction.
+            if (dC * dD < 0.0) {
+                D += 0.05 * ((dD > 0.0) ? 1.0 : -1.0);
+            } else if (dC * dD > 0.0) {
+                D -= 0.05 * ((dD > 0.0) ? 1.0 : -1.0);
+            }
+            // If dC ≈ 0, leave D unchanged.
+        }
     }
 
-    // Observed cost in this interval
-    double cost_interval = (double)dnodes / (double)dq;
-
-    // Current D
-    double D = idx->params.sampling_rate;
+    // Clamp D to [0, 1]
     if (D < 0.0) D = 0.0;
     if (D > 1.0) D = 1.0;
 
-    // Predicted cost under current model
-    double y_hat = idx->lr_w0 + idx->lr_w1 * D;
-    double err   = y_hat - cost_interval;  // gradient of squared loss
-
-    // SGD update for linear regression
-    idx->lr_w0 -= ETA * err;
-    idx->lr_w1 -= ETA * err * D;
-
-    // Choose new D as minimizer of cost_hat(D) = w0 + w1*D.
-    // For linear function, minimum on [0,1] is at one of the endpoints
-    // or where derivative is zero: d/dD (w0 + w1*D) = w1 => no interior min.
-    // So we use a simple heuristic: try to move opposite sign of w1.
-    double D_new;
-    if (fabs(idx->lr_w1) < 1e-6) {
-        // Model is almost flat; keep D unchanged.
-        D_new = D;
-    } else {
-        // If w1 > 0, cost increases with D -> move D down.
-        // If w1 < 0, cost decreases with D -> move D up.
-        double step = 0.05;
-        if (idx->lr_w1 > 0.0)
-            D_new = D - step;
-        else
-            D_new = D + step;
-    }
-
-    if (D_new < 0.0) D_new = 0.0;
-    if (D_new > 1.0) D_new = 1.0;
-
-    idx->params.sampling_rate = D_new;
-
-    // Update interval bookkeeping
+    idx->last_D           = idx->params.sampling_rate; // old D
+    idx->last_cost        = cost;
     idx->last_q_for_adapt = q;
-    idx->last_hot_nodes   = H;
-    idx->last_cold_nodes  = C;
+    idx->params.sampling_rate = D;                     // new D
 }
-
-// --- Sampling-based promotion ----------------------------------------
+// --- Sampling-based promotion ------------------------------------------
 
 static void maybe_promote(HCIndex *idx, BTKey k) {
     if (!idx->params.inclusive) {
@@ -134,7 +115,7 @@ static void maybe_promote(HCIndex *idx, BTKey k) {
         return;
     }
 
-    // 1) Sampling-based promotion: with probability D.
+    // 1) Sampling-based promotion: with probability (1 - D) skip.
     double D = idx->params.sampling_rate;
     if (D < 0.0) D = 0.0;
     if (D > 1.0) D = 1.0;
@@ -171,7 +152,7 @@ static void maybe_promote(HCIndex *idx, BTKey k) {
 BTPayload hc_search(HCIndex *idx, BTKey k) {
     idx->stats.queries++;
 
-    // Let the ML controller occasionally update D
+    // NEW: occasionally adapt sampling rate based on stats so far.
     hc_maybe_adapt_sampling(idx);
 
     BTStats hot_s = {0};
@@ -254,7 +235,13 @@ void hc_range_search(HCIndex *idx, BTKey lo, BTKey hi,
 
 HCStats hc_get_stats(HCIndex *idx) {
     HCStats s = idx->stats;
+
     s.hot_keys  = bt_count_keys(idx->hot);
     s.cold_keys = bt_count_keys(idx->cold);
+
+    // NEW: expose final ML-learned sampling rate
+    s.final_sampling_rate = idx->params.sampling_rate;
+
     return s;
 }
+

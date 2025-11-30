@@ -11,9 +11,9 @@ typedef struct {
     double max_hot_fraction; // e.g., 0.10 (10% of keys)
     int    inclusive;        // 1 = hot is a cache (no deletes in cold)
 
-    // Sampling + ML-style adaptation knobs
+    // NEW: sampling + ML-style adaptation knobs
     double sampling_rate;    // D in the paper, 0 < D <= 1
-    int    adapt_sampling;   // 0 = fixed D, 1 = adaptive (ML) controller
+    int    adapt_sampling;   // 0 = fixed D, 1 = adaptive controller
 } HCParams;
 
 // Statistics for evaluation.
@@ -28,6 +28,8 @@ typedef struct {
 
     size_t hot_keys;
     size_t cold_keys;
+    // NEW: exposes ML controller’s final sampling rate
+    double final_sampling_rate;
 } HCStats;
 
 // Main hot/cold index structure.
@@ -41,13 +43,10 @@ typedef struct {
     HCParams params;
     HCStats  stats;
 
-    // --- Online linear regression state (classic ML) ---
-    // We model: cost(D) ≈ w0 + w1 * D
-    long   last_q_for_adapt;   // queries at last adaptation point
-    long   last_hot_nodes;     // hot_node_visits at last adaptation
-    long   last_cold_nodes;    // cold_node_visits at last adaptation
-    double lr_w0;              // regression weight for bias
-    double lr_w1;              // regression weight for D
+    // NEW: simple ML-style adaptation state
+    long   last_q_for_adapt; // query count at last adjustment
+    double last_cost;        // cost per query at last adjustment
+    double last_D;           // last sampling_rate used
 } HCIndex;
 
 HCIndex* hc_create(int64_t max_key, int btree_degree, HCParams params);
