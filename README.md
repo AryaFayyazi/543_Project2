@@ -279,5 +279,8 @@ make
 ./hctree_demo --mode hctree   --workload zipf --theta 1.2 --csv >> results.csv
 
 python analyze_hctree.py
+
+To perform analysis for the various ML approaches, change to the appropriate branch and
+add the flags --sample_init 0.5 --adapt_sample 
 ```
 
